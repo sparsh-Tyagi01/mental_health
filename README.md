@@ -62,9 +62,10 @@ streamlit run app.py
 2. Select the target column (default is auto-chosen if available).
 3. Explore data in the `Data & EDA` tab.
 4. Apply imputation/outlier handling in `Cleaning & Engineering`.
+	- Choose numeric and categorical imputer methods before applying cleaning
 5. Choose modeling features in `Feature Selection`.
 6. Train in `Model Training`:
-	- Choose model (Logistic Regression or Random Forest)
+	- Choose model (Logistic Regression, Random Forest, SVM, or KNN)
 	- Set test split
 	- Set K-Fold value
 7. Review metrics in `Performance`:

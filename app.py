@@ -13,6 +13,7 @@ except Exception:
     PromptTemplate = None
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
@@ -26,6 +27,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import SVC
 from sklearn.compose import ColumnTransformer
 
 # Optional Gemini-backed LLM path.
@@ -69,6 +71,8 @@ def init_session_state() -> None:
         "removed_rows_df": None,
         "outlier_bounds_df": None,
         "pre_clean_df": None,
+        "numeric_imputer_strategy": "median",
+        "categorical_imputer_strategy": "most_frequent",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -89,7 +93,12 @@ def detect_numeric_and_categorical(df: pd.DataFrame, target_col: str) -> Tuple[L
     return numeric_cols, categorical_cols
 
 
-def handle_missing_values(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
+def handle_missing_values(
+    df: pd.DataFrame,
+    target_col: str,
+    numeric_strategy: str = "median",
+    categorical_strategy: str = "most_frequent",
+) -> pd.DataFrame:
     """Impute numeric with median and categorical with mode, excluding target."""
     updated = df.copy()
     feature_cols = [c for c in updated.columns if c != target_col]
@@ -100,14 +109,17 @@ def handle_missing_values(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
     categorical_cols = [c for c in feature_cols if c not in numeric_cols]
 
     if numeric_cols:
-        num_imputer = SimpleImputer(strategy="median")
+        num_imputer = SimpleImputer(strategy=numeric_strategy)
         updated[numeric_cols] = num_imputer.fit_transform(updated[numeric_cols])
 
     for col in categorical_cols:
         if updated[col].isna().any():
-            mode_series = updated[col].mode(dropna=True)
-            fill_value = mode_series.iloc[0] if not mode_series.empty else "Unknown"
-            updated[col] = updated[col].fillna(fill_value)
+            if categorical_strategy == "constant":
+                updated[col] = updated[col].fillna("Unknown")
+            else:
+                mode_series = updated[col].mode(dropna=True)
+                fill_value = mode_series.iloc[0] if not mode_series.empty else "Unknown"
+                updated[col] = updated[col].fillna(fill_value)
 
     return updated
 
@@ -171,21 +183,31 @@ def compute_iqr_outlier_mask(
     return mask, bounds_df
 
 
-def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
+def build_preprocessor(
+    X: pd.DataFrame,
+    numeric_strategy: str = "median",
+    categorical_strategy: str = "most_frequent",
+) -> ColumnTransformer:
     """Build preprocessing pipeline for mixed-type tabular data."""
     numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     categorical_cols = [c for c in X.columns if c not in numeric_cols]
 
     numeric_pipe = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
+            ("imputer", SimpleImputer(strategy=numeric_strategy)),
             ("scaler", StandardScaler()),
         ]
     )
 
     categorical_pipe = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy=categorical_strategy,
+                    fill_value="Unknown" if categorical_strategy == "constant" else None,
+                ),
+            ),
             ("onehot", OneHotEncoder(handle_unknown="ignore")),
         ]
     )
@@ -205,6 +227,10 @@ def get_model(model_name: str):
         return LogisticRegression(max_iter=1200, random_state=42)
     if model_name == "Random Forest":
         return RandomForestClassifier(n_estimators=250, random_state=42)
+    if model_name == "SVM":
+        return SVC(kernel="rbf", C=1.0, gamma="scale", random_state=42)
+    if model_name == "KNN":
+        return KNeighborsClassifier(n_neighbors=5)
     raise ValueError(f"Unsupported model selected: {model_name}")
 
 
@@ -415,9 +441,29 @@ with tab2:
     st.subheader("Automated Data Cleaning")
     target_col = st.session_state.target_column
 
+    st.markdown("**Imputer Method Selection**")
+    imp_a, imp_b = st.columns(2)
+    with imp_a:
+        numeric_imputer_choice = st.selectbox(
+            "Numeric imputer strategy",
+            options=["median", "mean", "most_frequent"],
+            index=["median", "mean", "most_frequent"].index(st.session_state.numeric_imputer_strategy),
+            help="Used for numeric columns during missing value handling.",
+        )
+    with imp_b:
+        categorical_imputer_choice = st.selectbox(
+            "Categorical imputer strategy",
+            options=["most_frequent", "constant"],
+            index=["most_frequent", "constant"].index(st.session_state.categorical_imputer_strategy),
+            help="For 'constant', missing categorical values are filled with 'Unknown'.",
+        )
+
+    st.session_state.numeric_imputer_strategy = numeric_imputer_choice
+    st.session_state.categorical_imputer_strategy = categorical_imputer_choice
+
     col_a, col_b = st.columns(2)
     with col_a:
-        do_impute = st.checkbox("Handle Missing Values (Median/Mode Imputation)")
+        do_impute = st.checkbox("Handle Missing Values (Configured Imputation)")
     with col_b:
         do_outlier = st.checkbox("Remove Outliers (IQR Method)")
 
@@ -441,7 +487,12 @@ with tab2:
 
             if do_impute:
                 before_na = int(updated_df.isna().sum().sum())
-                updated_df = handle_missing_values(updated_df, target_col)
+                updated_df = handle_missing_values(
+                    updated_df,
+                    target_col,
+                    numeric_strategy=st.session_state.numeric_imputer_strategy,
+                    categorical_strategy=st.session_state.categorical_imputer_strategy,
+                )
                 after_na = int(updated_df.isna().sum().sum())
                 logs.append(f"Missing values handled: {before_na} -> {after_na}")
                 report["missing_before_total"] = before_na
@@ -572,7 +623,10 @@ with tab4:
     st.subheader("Train ML Model")
     target_col = st.session_state.target_column
 
-    model_choice = st.selectbox("Select model", ["Logistic Regression", "Random Forest"])
+    model_choice = st.selectbox(
+        "Select model",
+        ["Logistic Regression", "Random Forest", "SVM", "KNN"],
+    )
     test_size_pct = st.slider("Test set percentage", min_value=10, max_value=40, value=20, step=5)
     k_folds = st.slider("K-Fold splits", min_value=3, max_value=10, value=5, step=1)
 
@@ -603,7 +657,11 @@ with tab4:
                 st.error("Target must contain at least 2 classes for classification.")
                 st.stop()
 
-            preprocessor = build_preprocessor(X)
+            preprocessor = build_preprocessor(
+                X,
+                numeric_strategy=st.session_state.numeric_imputer_strategy,
+                categorical_strategy=st.session_state.categorical_imputer_strategy,
+            )
             estimator = get_model(model_choice)
 
             model_pipeline = Pipeline(
