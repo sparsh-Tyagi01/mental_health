@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -9,26 +8,31 @@ import seaborn as sns
 import streamlit as st
 # LangChain is optional at runtime.
 try:
-    from langchain.prompts import PromptTemplate
-    from langchain.schema.runnable import RunnableLambda
+    from langchain_core.prompts import PromptTemplate
 except Exception:
     PromptTemplate = None
-    RunnableLambda = None
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import ConfusionMatrixDisplay, accuracy_score, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
-from joblib import dump, load
 
-# Optional OpenAI-backed LLM path. App works without it (fallback runnable is used).
+# Optional Gemini-backed LLM path.
 try:
-    from langchain_openai import ChatOpenAI
+    from langchain_google_genai import ChatGoogleGenerativeAI
 except Exception:
-    ChatOpenAI = None
+    ChatGoogleGenerativeAI = None
 
 
 # -----------------------------
@@ -42,44 +46,6 @@ st.set_page_config(
 
 st.title("🧠 AI-Based Mental Health Early Warning & Smart Intervention System")
 st.caption("Interactive ML pipeline dashboard using Streamlit + Scikit-Learn + LangChain")
-
-MODEL_ARTIFACT_PATH = Path("trained_mental_health_pipeline.joblib")
-MODEL_META_PATH = Path("trained_mental_health_pipeline_meta.json")
-
-
-def save_artifacts_to_disk() -> None:
-    """Persist trained model pipeline and metadata to disk."""
-    if st.session_state.pipeline is None:
-        raise ValueError("No trained pipeline found in session.")
-
-    dump(st.session_state.pipeline, MODEL_ARTIFACT_PATH)
-    metadata = {
-        "feature_columns": st.session_state.feature_columns,
-        "target_column": st.session_state.target_column,
-        "metrics": st.session_state.metrics,
-    }
-    MODEL_META_PATH.write_text(json.dumps(metadata, indent=2))
-
-
-def load_artifacts_from_disk() -> bool:
-    """Load persisted model pipeline and metadata into session state."""
-    if not MODEL_ARTIFACT_PATH.exists() or not MODEL_META_PATH.exists():
-        return False
-
-    pipeline = load(MODEL_ARTIFACT_PATH)
-    metadata = json.loads(MODEL_META_PATH.read_text())
-
-    st.session_state.pipeline = pipeline
-    st.session_state.feature_columns = metadata.get("feature_columns", [])
-    st.session_state.target_column = metadata.get("target_column", "risk_level")
-    st.session_state.metrics = metadata.get("metrics")
-
-    # Test artifacts are unavailable after restart until retraining.
-    st.session_state.X_test = None
-    st.session_state.y_test = None
-    st.session_state.y_pred = None
-    return True
-
 
 # -----------------------------
 # Session State Initialization
@@ -110,12 +76,6 @@ def init_session_state() -> None:
 
 
 init_session_state()
-if st.session_state.pipeline is None and MODEL_ARTIFACT_PATH.exists() and MODEL_META_PATH.exists():
-    try:
-        load_artifacts_from_disk()
-        st.sidebar.success("Persisted model loaded from disk.")
-    except Exception as ex:
-        st.sidebar.warning(f"Found saved model but failed to load: {ex}")
 
 
 # -----------------------------
@@ -253,6 +213,16 @@ def safe_json(obj: Dict) -> str:
     return json.dumps(obj, indent=2, default=str)
 
 
+def compute_weighted_metrics(y_true: pd.Series, y_pred: np.ndarray) -> Dict[str, float]:
+    """Compute core weighted metrics for classification evaluation."""
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision_weighted": float(precision_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "recall_weighted": float(recall_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "f1_weighted": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+    }
+
+
 # -----------------------------
 # Sidebar - File Upload
 # -----------------------------
@@ -262,6 +232,8 @@ uploaded_file = st.sidebar.file_uploader("Upload a CSV file", type=["csv"])
 if uploaded_file is not None:
     try:
         df = pd.read_csv(uploaded_file)
+        st.sidebar.success("Using uploaded dataset.")
+
         if df.empty:
             st.error("Uploaded CSV is empty. Please upload a valid dataset.")
             st.stop()
@@ -271,15 +243,21 @@ if uploaded_file is not None:
         if st.session_state.working_df is None:
             st.session_state.working_df = df.copy()
 
-        # If expected target is absent, fallback to last column and notify.
-        if "risk_level" not in st.session_state.working_df.columns:
-            fallback_target = st.session_state.working_df.columns[-1]
-            st.session_state.target_column = fallback_target
-            st.warning(
-                f"Expected target column 'risk_level' not found. Using '{fallback_target}' as target."
-            )
-        else:
-            st.session_state.target_column = "risk_level"
+        cols = st.session_state.working_df.columns.tolist()
+        if st.session_state.target_column not in cols:
+            if "risk_level" in cols:
+                st.session_state.target_column = "risk_level"
+            elif "treatment" in cols:
+                st.session_state.target_column = "treatment"
+            else:
+                st.session_state.target_column = cols[-1]
+
+        selected_target = st.sidebar.selectbox(
+            "Select target column",
+            options=cols,
+            index=cols.index(st.session_state.target_column),
+        )
+        st.session_state.target_column = selected_target
 
         st.success("CSV loaded successfully.")
 
@@ -310,6 +288,23 @@ tab_names = [
 # Tab 1: Data & EDA
 # -----------------------------
 with tab1:
+    st.subheader("Pipeline Steps Coverage")
+    st.markdown(
+        "\n".join(
+            [
+                "1. Input Data",
+                "2. Exploratory Data Analysis (EDA)",
+                "3. Data Engineering & Cleaning",
+                "4. Feature Selection",
+                "5. Data Split",
+                "6. Model Selection",
+                "7. Model Training",
+                "8. K-Fold Validation",
+                "9. Performance Metrics",
+            ]
+        )
+    )
+
     st.subheader("Dataset Preview")
     st.dataframe(st.session_state.working_df.head(20), use_container_width=True)
 
@@ -579,25 +574,7 @@ with tab4:
 
     model_choice = st.selectbox("Select model", ["Logistic Regression", "Random Forest"])
     test_size_pct = st.slider("Test set percentage", min_value=10, max_value=40, value=20, step=5)
-
-    action_col1, action_col2 = st.columns(2)
-    with action_col1:
-        if st.button("Load Saved Model"):
-            try:
-                if load_artifacts_from_disk():
-                    st.success("Saved model loaded from disk.")
-                else:
-                    st.warning("No saved model artifacts found yet.")
-            except Exception as ex:
-                st.error(f"Failed to load saved model: {ex}")
-
-    with action_col2:
-        if st.button("Save Current Model"):
-            try:
-                save_artifacts_to_disk()
-                st.success("Current model and metadata saved to disk.")
-            except Exception as ex:
-                st.error(f"Failed to save model: {ex}")
+    k_folds = st.slider("K-Fold splits", min_value=3, max_value=10, value=5, step=1)
 
     if st.button("Start Training Pipeline", type="primary"):
         try:
@@ -654,14 +631,64 @@ with tab4:
             st.session_state.y_pred = y_pred
             st.session_state.feature_columns = chosen_features
 
-            acc = accuracy_score(y_test, y_pred)
-            f1 = f1_score(y_test, y_pred, average="weighted")
-            st.session_state.metrics = {"accuracy": acc, "f1_weighted": f1, "model": model_choice}
+            holdout_metrics = compute_weighted_metrics(y_test, y_pred)
+            class_report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
 
-            # Auto-persist freshly trained model so it survives app restarts.
-            save_artifacts_to_disk()
+            cv_strategy = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
+            cv_scores = cross_validate(
+                model_pipeline,
+                X,
+                y,
+                cv=cv_strategy,
+                scoring=["accuracy", "precision_weighted", "recall_weighted", "f1_weighted"],
+                n_jobs=None,
+            )
+            cv_summary = {
+                "k_folds": int(k_folds),
+                "accuracy_mean": float(np.mean(cv_scores["test_accuracy"])),
+                "accuracy_std": float(np.std(cv_scores["test_accuracy"])),
+                "precision_weighted_mean": float(np.mean(cv_scores["test_precision_weighted"])),
+                "precision_weighted_std": float(np.std(cv_scores["test_precision_weighted"])),
+                "recall_weighted_mean": float(np.mean(cv_scores["test_recall_weighted"])),
+                "recall_weighted_std": float(np.std(cv_scores["test_recall_weighted"])),
+                "f1_weighted_mean": float(np.mean(cv_scores["test_f1_weighted"])),
+                "f1_weighted_std": float(np.std(cv_scores["test_f1_weighted"])),
+                "raw_folds": {
+                    "accuracy": cv_scores["test_accuracy"].tolist(),
+                    "precision_weighted": cv_scores["test_precision_weighted"].tolist(),
+                    "recall_weighted": cv_scores["test_recall_weighted"].tolist(),
+                    "f1_weighted": cv_scores["test_f1_weighted"].tolist(),
+                },
+            }
 
-            st.success("Training completed, saved in session, and persisted to disk.")
+            st.session_state.metrics = {
+                "model": model_choice,
+                "target": target_col,
+                "feature_count": int(len(chosen_features)),
+                "features": chosen_features,
+                "train_rows": int(X_train.shape[0]),
+                "test_rows": int(X_test.shape[0]),
+                "test_size_pct": int(test_size_pct),
+                "holdout": holdout_metrics,
+                "classification_report": class_report,
+                "kfold": cv_summary,
+            }
+
+            st.success("Training completed and saved in session.")
+            st.write("Data split complete:", {
+                "train_rows": int(X_train.shape[0]),
+                "test_rows": int(X_test.shape[0]),
+                "test_size_pct": int(test_size_pct),
+            })
+            st.write("Holdout metrics:", holdout_metrics)
+            st.write(
+                "K-Fold summary:",
+                {
+                    "k_folds": cv_summary["k_folds"],
+                    "accuracy_mean": round(cv_summary["accuracy_mean"], 4),
+                    "f1_weighted_mean": round(cv_summary["f1_weighted_mean"], 4),
+                },
+            )
             st.balloons()
 
         except Exception as ex:
@@ -678,11 +705,57 @@ with tab5:
         st.warning("No trained model found. Please train a model in 'Model Training' tab.")
     else:
         metrics = st.session_state.metrics or {}
+        holdout = metrics.get("holdout", {})
+        kfold = metrics.get("kfold", {})
 
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Model", str(metrics.get("model", "N/A")))
-        m2.metric("Accuracy", f"{metrics.get('accuracy', 0):.4f}")
-        m3.metric("F1 Score (Weighted)", f"{metrics.get('f1_weighted', 0):.4f}")
+        m2.metric("Holdout Accuracy", f"{holdout.get('accuracy', 0):.4f}")
+        m3.metric("Holdout F1 (Weighted)", f"{holdout.get('f1_weighted', 0):.4f}")
+        m4.metric("K-Fold Accuracy (Mean)", f"{kfold.get('accuracy_mean', 0):.4f}")
+
+        st.subheader("Holdout Set Metrics")
+        holdout_table = pd.DataFrame(
+            [
+                {
+                    "accuracy": holdout.get("accuracy", 0.0),
+                    "precision_weighted": holdout.get("precision_weighted", 0.0),
+                    "recall_weighted": holdout.get("recall_weighted", 0.0),
+                    "f1_weighted": holdout.get("f1_weighted", 0.0),
+                }
+            ]
+        )
+        st.dataframe(holdout_table.style.format("{:.4f}"), use_container_width=True)
+
+        if kfold:
+            st.subheader("K-Fold Cross Validation Summary")
+            kfold_table = pd.DataFrame(
+                [
+                    {
+                        "k_folds": kfold.get("k_folds", 0),
+                        "accuracy_mean": kfold.get("accuracy_mean", 0.0),
+                        "accuracy_std": kfold.get("accuracy_std", 0.0),
+                        "precision_weighted_mean": kfold.get("precision_weighted_mean", 0.0),
+                        "precision_weighted_std": kfold.get("precision_weighted_std", 0.0),
+                        "recall_weighted_mean": kfold.get("recall_weighted_mean", 0.0),
+                        "recall_weighted_std": kfold.get("recall_weighted_std", 0.0),
+                        "f1_weighted_mean": kfold.get("f1_weighted_mean", 0.0),
+                        "f1_weighted_std": kfold.get("f1_weighted_std", 0.0),
+                    }
+                ]
+            )
+            st.dataframe(kfold_table.style.format("{:.4f}"), use_container_width=True)
+
+            fold_scores = kfold.get("raw_folds", {})
+            if fold_scores:
+                st.write("Per-fold scores")
+                st.dataframe(pd.DataFrame(fold_scores), use_container_width=True)
+
+        report_dict = metrics.get("classification_report")
+        if report_dict:
+            st.subheader("Class-wise Classification Report (Holdout)")
+            report_df = pd.DataFrame(report_dict).transpose()
+            st.dataframe(report_df, use_container_width=True)
 
         st.subheader("Confusion Matrix")
         try:
@@ -692,11 +765,12 @@ with tab5:
                 st.info("Confusion matrix is available after a fresh train run in this session.")
                 st.stop()
 
-            labels = sorted(pd.Series(y_test).astype(str).unique().tolist())
+            labels = sorted(pd.unique(pd.concat([pd.Series(y_test), pd.Series(y_pred)], axis=0)).tolist())
             cm = confusion_matrix(y_test, y_pred, labels=labels)
 
             fig, ax = plt.subplots(figsize=(8, 5))
-            disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+            display_labels = [str(label) for label in labels]
+            disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
             disp.plot(ax=ax, cmap="Blues", colorbar=False)
             ax.set_title("Confusion Matrix")
             st.pyplot(fig)
@@ -756,7 +830,7 @@ with tab6:
                     patient_input[col] = st.selectbox(col, unique_vals)
 
             api_key = st.text_input(
-                "OpenAI API Key (required for Smart Intervention plan)",
+                "Gemini API Key (required for Smart Intervention plan)",
                 type="password",
                 help="The intervention plan is generated only when an API key is provided.",
             )
@@ -798,17 +872,21 @@ Keep tone supportive, actionable, and safe. Avoid diagnosis claims.
                 feature_payload = safe_json(patient_input)
 
                 if not api_key:
-                    st.info("Add an OpenAI API key to generate the Smart Intervention plan.")
+                    st.info("Add a Gemini API key to generate the Smart Intervention plan.")
                     st.stop()
 
-                if ChatOpenAI is None or PromptTemplate is None:
+                if ChatGoogleGenerativeAI is None or PromptTemplate is None:
                     st.error(
-                        "LangChain/OpenAI dependencies are unavailable. Install requirements to enable plan generation."
+                        "LangChain Gemini dependencies are unavailable. Install requirements to enable plan generation."
                     )
                     st.stop()
 
                 prompt_template = PromptTemplate.from_template(template_text)
-                llm = ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0.3)
+                llm = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash",
+                    google_api_key=api_key,
+                    temperature=0.3,
+                )
                 chain = prompt_template | llm
                 response = chain.invoke(
                     {"risk_level": pred_label, "feature_payload": feature_payload}
