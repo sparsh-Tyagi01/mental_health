@@ -73,6 +73,8 @@ def init_session_state() -> None:
         "pre_clean_df": None,
         "numeric_imputer_strategy": "median",
         "categorical_imputer_strategy": "most_frequent",
+        "apply_gender_encoding": True,
+        "risk_target_derived": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -249,6 +251,194 @@ def compute_weighted_metrics(y_true: pd.Series, y_pred: np.ndarray) -> Dict[str,
     }
 
 
+def is_gender_column(column_name: str) -> bool:
+    """Identify likely gender/sex columns by column name."""
+    normalized = column_name.strip().lower()
+    return "gender" in normalized or normalized == "sex" or normalized.endswith("_sex")
+
+
+def normalize_gender_value(value: object) -> object:
+    """Map free-text gender values into a compact canonical set for stable modeling/UI."""
+    if pd.isna(value):
+        return np.nan
+
+    raw = str(value).strip()
+    if not raw:
+        return np.nan
+
+    token = raw.lower().replace("_", " ").replace("-", " ")
+    token = " ".join(token.split())
+
+    male_tokens = {
+        "m", "male", "man", "boy", "cis male", "cis man", "mail", "make",
+    }
+    female_tokens = {
+        "f", "female", "woman", "girl", "cis female", "cis woman", "femake",
+    }
+    other_tokens = {
+        "other", "non binary", "nonbinary", "nb", "genderqueer", "agender",
+        "trans", "transgender", "trans male", "trans female", "fluid", "queer",
+        "prefer not to say", "rather not say",
+    }
+
+    if token in male_tokens:
+        return "Male"
+    if token in female_tokens:
+        return "Female"
+    if token in other_tokens:
+        return "Other"
+
+    if "male" in token and "female" not in token:
+        return "Male"
+    if "female" in token:
+        return "Female"
+    if "trans" in token or "non" in token or "queer" in token:
+        return "Other"
+
+    return "Other"
+
+
+def normalize_gender_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize detected gender columns to: Male/Female/Other."""
+    updated = df.copy()
+    for col in updated.columns:
+        if is_gender_column(col) and not pd.api.types.is_numeric_dtype(updated[col]):
+            updated[col] = updated[col].apply(normalize_gender_value)
+    return updated
+
+
+def build_gender_encoding_preview(df: pd.DataFrame) -> pd.DataFrame:
+    """Return value-level preview of raw gender values and their encoded mapping."""
+    records = []
+    for col in df.columns:
+        if not is_gender_column(col) or pd.api.types.is_numeric_dtype(df[col]):
+            continue
+
+        value_counts = (
+            df[col]
+            .astype("string")
+            .fillna("<NA>")
+            .str.strip()
+            .replace("", "<NA>")
+            .value_counts(dropna=False)
+        )
+        for raw_value, count in value_counts.items():
+            encoded_value = normalize_gender_value(raw_value if raw_value != "<NA>" else np.nan)
+            records.append(
+                {
+                    "column": col,
+                    "raw_value": raw_value,
+                    "encoded_value": "<NA>" if pd.isna(encoded_value) else str(encoded_value),
+                    "count": int(count),
+                }
+            )
+
+    if not records:
+        return pd.DataFrame(columns=["column", "raw_value", "encoded_value", "count"])
+
+    preview_df = pd.DataFrame(records)
+    return preview_df.sort_values(by=["column", "count", "raw_value"], ascending=[True, False, True]).reset_index(
+        drop=True
+    )
+
+
+def normalize_risk_value(value: object) -> Optional[str]:
+    """Normalize risk labels to Low/Medium/High where possible."""
+    if pd.isna(value):
+        return None
+
+    token = str(value).strip().lower()
+    if not token:
+        return None
+
+    if token in {"low", "l", "0", "minimal", "none"}:
+        return "Low"
+    if token in {"medium", "med", "m", "1", "moderate"}:
+        return "Medium"
+    if token in {"high", "h", "2", "severe"}:
+        return "High"
+    return None
+
+
+def _yes_no_score(value: object, yes_score: float = 1.0) -> float:
+    """Convert Yes/No style values into risk score contribution."""
+    if pd.isna(value):
+        return 0.0
+    return yes_score if str(value).strip().lower() == "yes" else 0.0
+
+
+def _work_interfere_score(value: object) -> float:
+    """Convert work interference text to risk score contribution."""
+    if pd.isna(value):
+        return 0.0
+    mapping = {
+        "never": 0.0,
+        "rarely": 0.5,
+        "sometimes": 1.0,
+        "often": 2.0,
+    }
+    return mapping.get(str(value).strip().lower(), 0.0)
+
+
+def _leave_difficulty_score(value: object) -> float:
+    """Convert workplace leave comfort text to risk score contribution."""
+    if pd.isna(value):
+        return 0.0
+    token = str(value).strip().lower()
+    if token == "very difficult":
+        return 1.0
+    if token == "somewhat difficult":
+        return 0.7
+    if token == "somewhat easy":
+        return 0.2
+    if token == "very easy":
+        return 0.0
+    return 0.0
+
+
+def derive_risk_level(df: pd.DataFrame) -> pd.Series:
+    """Create Low/Medium/High risk labels from available survey indicators."""
+    score = pd.Series(0.0, index=df.index)
+
+    if "treatment" in df.columns:
+        score += df["treatment"].apply(lambda v: _yes_no_score(v, yes_score=1.5))
+    if "family_history" in df.columns:
+        score += df["family_history"].apply(lambda v: _yes_no_score(v, yes_score=1.2))
+    if "work_interfere" in df.columns:
+        score += df["work_interfere"].apply(_work_interfere_score)
+    if "mental_health_consequence" in df.columns:
+        score += df["mental_health_consequence"].apply(lambda v: _yes_no_score(v, yes_score=0.8))
+    if "leave" in df.columns:
+        score += df["leave"].apply(_leave_difficulty_score)
+
+    def to_bucket(v: float) -> str:
+        if v >= 3.5:
+            return "High"
+        if v >= 1.8:
+            return "Medium"
+        return "Low"
+
+    return score.apply(to_bucket)
+
+
+def ensure_risk_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
+    """Ensure risk_level exists and is normalized to Low/Medium/High."""
+    updated = df.copy()
+    derived = False
+
+    if "risk_level" in updated.columns:
+        normalized = updated["risk_level"].apply(normalize_risk_value)
+        unresolved_mask = normalized.isna()
+        if unresolved_mask.any():
+            normalized = normalized.where(~unresolved_mask, derive_risk_level(updated))
+        updated["risk_level"] = normalized.fillna("Medium")
+    else:
+        updated["risk_level"] = derive_risk_level(updated)
+        derived = True
+
+    return updated, derived
+
+
 # -----------------------------
 # Sidebar - File Upload
 # -----------------------------
@@ -258,6 +448,7 @@ uploaded_file = st.sidebar.file_uploader("Upload a CSV file", type=["csv"])
 if uploaded_file is not None:
     try:
         df = pd.read_csv(uploaded_file)
+        df, risk_derived = ensure_risk_target(df)
         st.sidebar.success("Using uploaded dataset.")
 
         if df.empty:
@@ -265,25 +456,25 @@ if uploaded_file is not None:
             st.stop()
 
         st.session_state.raw_df = df.copy()
+        st.session_state.risk_target_derived = risk_derived
 
         if st.session_state.working_df is None:
             st.session_state.working_df = df.copy()
+        else:
+            # Keep in-session dataframe but ensure risk target stays available.
+            st.session_state.working_df, _ = ensure_risk_target(st.session_state.working_df)
 
-        cols = st.session_state.working_df.columns.tolist()
-        if st.session_state.target_column not in cols:
-            if "risk_level" in cols:
-                st.session_state.target_column = "risk_level"
-            elif "treatment" in cols:
-                st.session_state.target_column = "treatment"
-            else:
-                st.session_state.target_column = cols[-1]
-
-        selected_target = st.sidebar.selectbox(
-            "Select target column",
-            options=cols,
-            index=cols.index(st.session_state.target_column),
+        st.session_state.target_column = "risk_level"
+        st.sidebar.selectbox(
+            "Prediction target",
+            options=["risk_level"],
+            index=0,
+            disabled=True,
+            help="Risk prediction is fixed to Low/Medium/High.",
         )
-        st.session_state.target_column = selected_target
+
+        if st.session_state.risk_target_derived:
+            st.sidebar.info("risk_level generated automatically from survey indicators.")
 
         st.success("CSV loaded successfully.")
 
@@ -467,6 +658,28 @@ with tab2:
     with col_b:
         do_outlier = st.checkbox("Remove Outliers (IQR Method)")
 
+    do_gender_encoding = st.checkbox(
+        "Apply Gender Encoding (Male/Female/Other)",
+        value=st.session_state.apply_gender_encoding,
+        help="Encodes detected gender/sex columns into a compact category set.",
+    )
+    st.session_state.apply_gender_encoding = do_gender_encoding
+
+    with st.expander("Gender Encoding Preview", expanded=False):
+        preview_df = build_gender_encoding_preview(st.session_state.working_df)
+        if preview_df.empty:
+            st.info("No non-numeric gender/sex column found for encoding preview.")
+        else:
+            preview_cols = preview_df["column"].unique().tolist()
+            selected_preview_col = st.selectbox("Preview column", options=preview_cols)
+            col_preview_df = preview_df[preview_df["column"] == selected_preview_col].copy()
+            st.dataframe(col_preview_df, use_container_width=True)
+
+            encoded_unique = sorted(
+                [v for v in col_preview_df["encoded_value"].dropna().astype(str).unique().tolist() if v != "<NA>"]
+            )
+            st.write("Encoded categories:", encoded_unique if encoded_unique else ["<NA>"])
+
     if st.button("Apply Cleaning Steps", type="primary"):
         try:
             updated_df = st.session_state.working_df.copy()
@@ -484,6 +697,17 @@ with tab2:
             }
             st.session_state.removed_rows_df = None
             st.session_state.outlier_bounds_df = None
+
+            if do_gender_encoding:
+                before_gender_preview = build_gender_encoding_preview(updated_df)
+                updated_df = normalize_gender_columns(updated_df)
+                after_gender_preview = build_gender_encoding_preview(updated_df)
+                if before_gender_preview.empty:
+                    logs.append("Gender encoding skipped: no gender/sex column detected")
+                else:
+                    before_unique = int(before_gender_preview["raw_value"].nunique())
+                    after_unique = int(after_gender_preview["raw_value"].nunique())
+                    logs.append(f"Gender encoding unique values: {before_unique} -> {after_unique}")
 
             if do_impute:
                 before_na = int(updated_df.isna().sum().sum())
@@ -592,16 +816,27 @@ with tab3:
     else:
         all_features = [c for c in st.session_state.working_df.columns if c != target_col]
 
+        default_selected = st.session_state.selected_features
+        if not default_selected:
+            default_selected = all_features
+        else:
+            # Keep only currently available columns if dataset schema changed.
+            default_selected = [c for c in default_selected if c in all_features]
+            if not default_selected:
+                default_selected = all_features
+
         feature_mode = st.radio(
             "Selection mode",
             ["Keep selected features", "Drop selected features"],
             horizontal=True,
+            key="feature_selection_mode",
         )
 
         selected = st.multiselect(
             "Choose columns",
             options=all_features,
-            default=all_features,
+            default=default_selected,
+            key="feature_selection_columns",
         )
 
         if feature_mode == "Keep selected features":
@@ -851,6 +1086,16 @@ with tab6:
             st.stop()
 
         current_df = st.session_state.working_df
+        missing_cols = [c for c in feature_cols if c not in current_df.columns]
+        if missing_cols:
+            st.error(
+                "Current dataset is missing trained feature columns. "
+                "Please retrain the model after cleaning/feature changes."
+            )
+            st.write("Missing columns:", missing_cols)
+            st.stop()
+
+        st.caption("Input form uses only the features selected during model training.")
 
         with st.form("intervention_form"):
             st.write("Enter hypothetical patient profile:")
@@ -882,10 +1127,13 @@ with tab6:
                         )
                 else:
                     # Categorical fields use selectbox from known unique values.
-                    unique_vals = series.dropna().astype(str).unique().tolist()
-                    if not unique_vals:
-                        unique_vals = ["Unknown"]
-                    patient_input[col] = st.selectbox(col, unique_vals)
+                    if is_gender_column(col):
+                        patient_input[col] = st.selectbox(col, ["Male", "Female", "Other", "Unknown"])
+                    else:
+                        unique_vals = series.dropna().astype(str).unique().tolist()
+                        if not unique_vals:
+                            unique_vals = ["Unknown"]
+                        patient_input[col] = st.selectbox(col, unique_vals)
 
             api_key = st.text_input(
                 "Gemini API Key (required for Smart Intervention plan)",
